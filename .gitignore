@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+
+# Virtual env
+.venv/
+.venv312/
+venv/
+ENV/
+
+# Playwright cache & browsers
+playwright-report/
+playwright/.cache/
+ms-playwright/
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log
+
+# Outputs
+outputs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Coverage / test
+.coverage
+htmlcov/
+.pytest_cache/
