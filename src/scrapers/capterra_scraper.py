@@ -1,8 +1,15 @@
 # src/scrapers/capterra_scraper.py
 from src.scrapers.async_base_scraper import AsyncBaseScraper
 from typing import List, Dict, Optional
-from urllib.parse import quote
-import logging
+from urllib.parse import quote, urlparse
+import logging, re
+from datetime import date
+
+try:
+    import requests  # type: ignore
+except Exception:
+    requests = None  # type: ignore
+from src.utils import parse_date_fuzzy
 
 log = logging.getLogger("capterrascraper")
 
@@ -97,3 +104,103 @@ class CapterraScraper(AsyncBaseScraper):
                 "reviewer_name": reviewer_name
             })
         return reviews
+
+
+# --- API-first helpers ---
+def discover_capterra_product_id(product_url: str) -> Optional[str]:
+    """Attempt to discover the Capterra productId from the product page HTML."""
+    # 1) Try to parse directly from canonical /p/<id>/ path in the URL (no network needed)
+    m = re.search(r"/p/(\d+)/", product_url)
+    if m:
+        return m.group(1)
+
+    # 2) If not present, optionally fetch page HTML as fallback (may be blocked by bot protections)
+    if requests is None:
+        raise RuntimeError("'requests' package not installed. Add it to requirements.txt and install.")
+    parsed = urlparse(product_url)
+    if not parsed.scheme:
+        product_url = "https://" + product_url.lstrip("/")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.capterra.com/",
+        "Connection": "keep-alive",
+        "Cache-Control": "no-cache",
+    }
+    r = requests.get(product_url, headers=headers, timeout=30)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Capterra product page fetch failed {r.status_code}")
+    html = r.text
+    for pattern in [r'"productId"\s*:\s*"?(\d+)"?', r'data-product-id=\"(\d+)\"']:
+        m = re.search(pattern, html)
+        if m:
+            return m.group(1)
+    return None
+
+
+def fetch_capterra_reviews_api(
+    product_id: str,
+    start: Optional[date] = None,
+    end: Optional[date] = None,
+    limit: Optional[int] = None,
+    debug: bool = False,
+) -> List[Dict]:
+    """
+    Calls Capterra's reviews JSON endpoint used by the product page XHR.
+    Endpoint varies by region; we'll use .com by default.
+    """
+    if requests is None:
+        raise RuntimeError("'requests' package not installed. Add it to requirements.txt and install.")
+    base = "https://www.capterra.com/spotlight/rest/reviews"
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "saas-review-scraper/0.1",
+        "Referer": "https://www.capterra.com/",
+    }
+    collected: List[Dict] = []
+    page = 1
+    per_page = 50
+    while True:
+        params = {
+            "productId": product_id,
+            "page": page,
+            "pageSize": per_page,
+            # Other filters can be added if known (ratings, sort, etc.)
+        }
+        r = requests.get(base, headers=headers, params=params, timeout=30)
+        if debug:
+            log.debug("Capterra API GET %s | status=%s", r.url, r.status_code)
+        if r.status_code >= 400:
+            raise RuntimeError(f"Capterra API error {r.status_code}: {r.text[:300]}")
+        data = r.json()
+        items = data.get("reviews") or data.get("data") or []
+        if not items:
+            break
+        for it in items:
+            title = it.get("title") or it.get("headline")
+            body = it.get("review") or it.get("text") or it.get("body")
+            dt = it.get("date") or it.get("createdAt") or it.get("created_at")
+            rating = it.get("rating") or it.get("overallRating")
+            reviewer = None
+            user = it.get("user") or {}
+            if isinstance(user, dict):
+                reviewer = user.get("name") or user.get("displayName")
+            d = None
+            if isinstance(dt, str):
+                d = parse_date_fuzzy(dt)
+            collected.append(
+                {
+                    "title": title,
+                    "review": body,
+                    "date": d.isoformat() if d else dt,
+                    "rating": float(rating) if rating is not None else None,
+                    "reviewer_name": reviewer,
+                }
+            )
+            if limit is not None and len(collected) >= limit:
+                return collected[:limit]
+        if len(items) < per_page:
+            break
+        page += 1
+    return collected

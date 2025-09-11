@@ -7,8 +7,14 @@ same interface pattern as G2 & Capterra scrapers.
 from urllib.parse import quote
 from typing import List, Dict, Optional
 import logging
+from datetime import date
 
 from src.scrapers.async_base_scraper import AsyncBaseScraper
+try:
+    import requests  # type: ignore
+except Exception:
+    requests = None  # type: ignore
+from src.utils import parse_date_fuzzy
 
 log = logging.getLogger("trustradiusscraper")
 
@@ -55,6 +61,58 @@ class TrustRadiusScraper(AsyncBaseScraper):
 
     async def extract_reviews_from_page(self, page) -> List[Dict]:
         reviews: List[Dict] = []
+        # small scroll to trigger lazy content
+        try:
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(600)
+        except Exception:
+            pass
+
+        # JSON-LD first
+        try:
+            scripts = await page.query_selector_all("script[type='application/ld+json']")
+            import json
+            from src.utils import parse_date_fuzzy as _p
+            for s in scripts:
+                try:
+                    raw = await s.inner_text()
+                    if not raw:
+                        continue
+                    data = json.loads(raw)
+                    nodes = data if isinstance(data, list) else [data]
+                    for node in nodes:
+                        if not isinstance(node, dict):
+                            continue
+                        if node.get("@type") == "Review":
+                            title = node.get("name") or node.get("headline")
+                            body = node.get("reviewBody") or node.get("description")
+                            dt = node.get("datePublished") or node.get("dateCreated")
+                            rating = None
+                            rr = node.get("reviewRating")
+                            if isinstance(rr, dict):
+                                rv = rr.get("ratingValue")
+                                try:
+                                    rating = float(rv) if rv is not None else None
+                                except Exception:
+                                    rating = None
+                            author = node.get("author")
+                            reviewer = None
+                            if isinstance(author, dict):
+                                reviewer = author.get("name")
+                            d = _p(dt) if isinstance(dt, str) else None
+                            reviews.append({
+                                "title": title,
+                                "review": body,
+                                "date": d.isoformat() if d else dt,
+                                "rating": rating,
+                                "reviewer_name": reviewer,
+                            })
+                except Exception:
+                    continue
+            if reviews:
+                return reviews
+        except Exception:
+            pass
         # Candidate selectors for review container. Adjust after inspection.
         container_selectors = [
             "div.review-card",              # hypothetical
@@ -197,3 +255,83 @@ class TrustRadiusScraper(AsyncBaseScraper):
             except Exception:
                 continue
         return await super().go_to_next_page(page)
+
+
+# --- API-first helper (via Apify TrustRadius actor) ---
+def fetch_trustradius_via_apify(
+    product_url: str,
+    apify_token: str,
+    start: Optional[date] = None,
+    end: Optional[date] = None,
+    limit: Optional[int] = None,
+    debug: bool = False,
+) -> List[Dict]:
+    """
+    Uses an Apify TrustRadius actor to fetch reviews without Playwright locally.
+    You need an Apify account and an actor ID that returns TrustRadius reviews.
+    The default public actor "apify/website-content-crawler" can be configured,
+    but ideally use a dedicated TrustRadius actor if available.
+    """
+    if requests is None:
+        raise RuntimeError("'requests' package not installed. Add it to requirements.txt and install.")
+
+    # Example using generic Apify actor; replace ACTOR_ID with a TrustRadius-specific actor if you have one.
+    ACTOR_ID = "apify/website-content-crawler"
+    start_url = product_url
+    run_url = f"https://api.apify.com/v2/acts/{ACTOR_ID}/runs?token={apify_token}"
+    payload = {
+        "startUrls": [{"url": start_url}],
+        # Narrow to the reviews area via link selectors or pseudo URL patterns if needed.
+        "maxDepth": 1,
+        "useRequestQueue": False,
+        "crawlerType": "playwright:chromium",
+        "maxRequestsPerCrawl": 50,
+        "headless": True,
+    }
+    r = requests.post(run_url, json=payload, timeout=60)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Apify run start failed {r.status_code}: {r.text[:300]}")
+    run = r.json().get("data") or {}
+    items_url = None
+    dataset_id = (run.get("defaultDatasetId") if isinstance(run, dict) else None)
+    if dataset_id:
+        items_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items?clean=true&token={apify_token}"
+    else:
+        # Fallback: get from run resource
+        items_url = (run.get("defaultDatasetUrl") if isinstance(run, dict) else None)
+    if not items_url:
+        raise RuntimeError("Apify run didn't return dataset info; cannot fetch items.")
+
+    # Poll for dataset readiness (simple loop)
+    import time
+    for _ in range(30):
+        ir = requests.get(items_url, timeout=30)
+        if ir.status_code == 200 and ir.headers.get("content-type", "").startswith("application/json"):
+            items = ir.json()
+            if isinstance(items, list) and items:
+                break
+        time.sleep(2)
+    else:
+        items = []
+
+    collected: List[Dict] = []
+    for it in items:
+        # Heuristically pull text content from the page section.
+        text = it.get("text") or it.get("markdown") or it.get("body") or ""
+        url = it.get("url")
+        dt = it.get("date") or it.get("publishedAt")
+        d = parse_date_fuzzy(dt) if isinstance(dt, str) else None
+        collected.append(
+            {
+                "title": None,
+                "review": text,
+                "date": d.isoformat() if d else dt,
+                "rating": None,
+                "reviewer_name": None,
+                "source_url": url,
+            }
+        )
+        if limit is not None and len(collected) >= limit:
+            return collected[:limit]
+
+    return collected

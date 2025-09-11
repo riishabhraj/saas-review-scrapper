@@ -1,15 +1,17 @@
 # src/cli.py
-import typer
+import asyncio
+import logging
 from datetime import datetime
+from typing import Optional, List
+
+import typer
+
 from src.scrapers.g2_scraper import G2Scraper
 from src.scrapers.capterra_scraper import CapterraScraper
 from src.scrapers.trustradius_scraper import TrustRadiusScraper
 from src.output import write_result
 from src.utils import iso_now
-from src.models import ScrapeResult, Review  # added
-import logging
-import json
-import sys
+from src.models import ScrapeResult, Review
 
 app = typer.Typer()
 logging.basicConfig(level=logging.INFO)
@@ -22,12 +24,14 @@ SCRAPER_MAP = {
 
 @app.command()
 def scrape(
-    company: str = typer.Option(..., help="Company or product name (quotes if spaces)"),
+    company: str = typer.Option(..., help="Company or product name"),
     start: str = typer.Option(..., help="Start date YYYY-MM-DD"),
     end: str = typer.Option(..., help="End date YYYY-MM-DD"),
     source: str = typer.Option("g2", help="g2 | capterra | trustradius"),
-    product_url: str = typer.Option(None, help="Optional product page URL to skip search"),
-    headless: bool = typer.Option(True, help="Run browser headless"),
+    product_url: Optional[str] = typer.Option(None, help="Product reviews URL to skip search"),
+    headless: bool = typer.Option(True, help="Run browser headless (use --no-headless to disable)"),
+    limit: Optional[int] = typer.Option(None, help="Max reviews to keep (debug)"),
+    verbose: bool = typer.Option(False, help="Print first validated review"),
 ):
     try:
         start_date = datetime.fromisoformat(start).date()
@@ -49,10 +53,17 @@ def scrape(
     )
     typer.echo(f"Scraping {company} from {source} between {start} and {end} ...")
     try:
-        reviews = scraper.scrape()
+        maybe_coro = scraper.scrape()
+        if asyncio.iscoroutine(maybe_coro):
+            reviews = asyncio.run(maybe_coro)
+        else:
+            reviews = maybe_coro
     except Exception as e:
         typer.echo(f"Error during scraping: {e}")
         raise typer.Exit(code=2)
+
+    if limit is not None:
+        reviews = reviews[:limit]
 
     # Validation layer
     try:
@@ -65,14 +76,14 @@ def scrape(
         result_model = ScrapeResult(
             company=company,
             source=source,
-            start_date=start_date.isoformat(),
-            end_date=end_date.isoformat(),
+            start_date=start_date,
+            end_date=end_date,
             scraped_at=iso_now(),
             reviews=review_models,
             meta={
                 "reviews_found": len(review_models),
-                "raw_reviews_count": len(reviews)
-            }
+                "raw_reviews_count": len(reviews),
+            },
         )
         result = result_model.model_dump()
     except Exception as e:
@@ -80,6 +91,9 @@ def scrape(
         raise typer.Exit(code=3)
 
     outpath = write_result(result, company, source, start, end)
+    if verbose and result.get("reviews"):
+        first = result["reviews"][0]
+        logging.info(f"First review: {first}")
     typer.echo(f"Wrote {len(result['reviews'])} validated reviews to {outpath}")
 
 if __name__ == "__main__":

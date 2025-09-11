@@ -7,3 +7,4 @@ tqdm
 playwright
 fastapi
 uvicorn
+requests
