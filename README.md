@@ -40,6 +40,8 @@ Optional (improve block avoidance):
   "limit": 20,
   "capterra_product_id": 79104,
   "capterra_region": "in",
+  "start": "2024-01-01",
+  "end": "2024-12-31",
   "debug": false
 }
 ```
@@ -48,7 +50,10 @@ Notes:
 - capterra_product_id: Strongly recommended for Capterra (ensures direct path)
 - capterra_region: Optional (.com if omitted)
 - limit: Per-source soft cap (first page may return fewer/more depending on platform pagination)
+- start / end: Optional inclusive ISO date filters (reviews outside range dropped or counted invalid if debug)
 - debug: If true, returns invalid_details (why reviews were skipped)
+
+Extended examples: see `NOTION_EXAMPLES.md`.
 
 ## Minimal Payloads
 Source-specific minimal viable examples:
