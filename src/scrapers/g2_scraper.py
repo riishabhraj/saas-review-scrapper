@@ -4,42 +4,212 @@ from typing import List, Dict, Optional
 from urllib.parse import quote
 import logging
 from datetime import date
+import json
+import re
+import html as htmllib
+import random
+from src.utils import parse_date_fuzzy
 
 # API-first dependencies
 try:
     import requests  # type: ignore
 except Exception:  # pragma: no cover - optional import, validated at runtime
     requests = None  # type: ignore
-from src.utils import parse_date_fuzzy
 
 log = logging.getLogger("g2scraper")
 
 class G2Scraper(AsyncBaseScraper):
-    # Realistic G2 search URL pattern observed, includes utf8 checkmark + source param.
     BASE_SEARCH = "https://www.g2.com/search?utf8=%E2%9C%93&query={q}&source=search"
-    # If user passes product_url, we will use it directly.
 
-    async def find_product_page(self, page) -> Optional[str]:
-        # If user provided direct product_url, use it
-        if self.product_url:
-            return self.product_url
+    _UA_POOL = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    ]
+    _BLOCK_MARKERS = [
+        "access blocked",
+        "unusual activity",
+        "verify you are a human",
+        "bot detected",
+        "perimeterx",
+        "captcha",
+        "recaptcha",
+    ]
 
-        # otherwise try to use G2 search
-        q = quote(self.company)
-        search_url = self.BASE_SEARCH.format(q=q)
-        log.info(f"Searching G2: {search_url}")
-        await page.goto(search_url, wait_until="networkidle")
-
-        # Attempt: wait briefly for any product links to render.
+    async def _harden_page(self, page):
         try:
-            await page.wait_for_timeout(500)  # small delay; adjust if needed
+            vw = random.choice([(1366,768),(1440,900),(1536,864),(1280,800),(1920,1080)])
+            await page.set_viewport_size({"width": vw[0] + random.randint(-25,15), "height": vw[1] + random.randint(-30,30)})
+        except Exception:
+            pass
+        try:
+            await page.add_init_script(
+                """
+                Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
+                Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});
+                Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']});
+                window.chrome = { runtime: {} };
+                const pr = window.devicePixelRatio || 1;
+                Object.defineProperty(window,'devicePixelRatio',{get:()=>pr + (Math.random()*0.00001)});
+                Object.defineProperty(Notification,'permission',{get:()=> 'default'});
+                """
+            )
         except Exception:
             pass
 
-        # Slug heuristic (company name to product slug) e.g. "HubSpot" -> "hubspot"
-        slug = self.company.lower().strip().replace(" ", "-")
+    async def _human_mouse(self, page, moves=4):
+        try:
+            for _ in range(moves):
+                await page.mouse.move(random.randint(40,900), random.randint(50,700), steps=random.randint(5,12))
+                await page.wait_for_timeout(random.randint(120,340))
+        except Exception:
+            pass
+
+    async def _scroll_slow(self, page, segments=3):
+        try:
+            for _ in range(segments):
+                await page.evaluate("window.scrollBy(0, Math.floor(window.innerHeight * (0.25 + Math.random()*0.45)))")
+                await page.wait_for_timeout(random.randint(400,950))
+        except Exception:
+            pass
+
+    async def _is_blocked(self, page) -> bool:
+        try:
+            snippet = (await page.content())[:15000].lower()
+            return any(m in snippet for m in self._BLOCK_MARKERS)
+        except Exception:
+            return False
+
+    def _slugify(self, name: str) -> str:
+        s = name.lower().strip()
+        s = re.sub(r"[^a-z0-9]+","-", s)
+        s = re.sub(r"-+","-", s).strip('-')
+        return s or name.lower()
+
+    async def _type_like_user(self, page, selector: str, text: str):
+        try:
+            el = await page.wait_for_selector(selector, timeout=5000)
+            await el.click()
+            for ch in text:
+                await page.keyboard.type(ch, delay=random.randint(70,160))
+            await page.wait_for_timeout(random.randint(650,1150))
+        except Exception:
+            pass
+
+    async def _user_flow_search_to_reviews(self, page, slug: str) -> Optional[str]:
+        try:
+            await self._harden_page(page)
+            await page.goto("https://www.g2.com/", wait_until="domcontentloaded")
+            await page.wait_for_timeout(random.randint(1200,2100))
+            await self._human_mouse(page)
+            await self._type_like_user(page, "input[name='query'], input[type='search']", self.company)
+            await page.wait_for_timeout(random.randint(700,1300))
+            selectors = [
+                f"a[href*='/products/{slug}']",
+                "a.result-card__name",
+                "a.search-result__title",
+                "a[href*='/products/']"
+            ]
+            candidate = None
+            for sel in selectors:
+                try:
+                    el = await page.query_selector(sel)
+                    if el:
+                        href = await el.get_attribute("href")
+                        if href:
+                            if href.startswith('/'):
+                                href = "https://www.g2.com" + href
+                            candidate = href
+                            await el.click()
+                            await page.wait_for_timeout(random.randint(1600,2600))
+                            break
+                except Exception:
+                    continue
+            if not candidate:
+                return None
+            if await self._is_blocked(page):
+                return None
+            await self._scroll_slow(page, segments=random.randint(2,4))
+            try:
+                link = await page.query_selector("a[href$='/reviews'], a[href*='/reviews?']")
+                if link:
+                    await self._human_mouse(page, moves=2)
+                    await link.click()
+                    await page.wait_for_timeout(random.randint(1400,2300))
+            except Exception:
+                pass
+            if "/reviews" not in page.url:
+                await page.wait_for_timeout(random.randint(900,1500))
+                await page.goto(f"https://www.g2.com/products/{slug}/reviews", wait_until="domcontentloaded")
+                await page.wait_for_timeout(random.randint(900,1500))
+            if await self._is_blocked(page):
+                return None
+            current = page.url.split('?')[0].rstrip('/')
+            if current.endswith(f"/{slug}/reviews"):
+                return current
+        except Exception:
+            return None
+        return None
+
+    async def find_product_page(self, page) -> Optional[str]:
+        if self.product_url:
+            return self.product_url.rstrip('/')
+        slug = self._slugify(self.company)
+        direct = f"https://www.g2.com/products/{slug}/reviews"
+
+        attempts = [
+            ("direct_fast", direct),
+            ("human_path", None),
+            ("direct_retry", direct),
+        ]
+
+        for name, url in attempts:
+            try:
+                await self._harden_page(page)
+                if name.startswith("direct"):
+                    await page.goto(url, wait_until="domcontentloaded")
+                    await page.wait_for_timeout(random.randint(900,1700))
+                    await self._human_mouse(page, moves=3)
+                    if await self._is_blocked(page):
+                        logging.warning(f"G2 blocked on {name}")
+                        await page.wait_for_timeout(random.randint(850,1400))
+                        continue
+                    if "/reviews" in page.url:
+                        logging.info(f"G2 success via {name}: {page.url}")
+                        return page.url.split('?')[0].rstrip('/')
+                else:
+                    logging.info("G2 attempting human_path flow")
+                    dest = await self._user_flow_search_to_reviews(page, slug)
+                    if dest:
+                        logging.info("G2 success via human_path")
+                        return dest
+                    else:
+                        logging.warning("G2 human_path failed or blocked")
+                await page.wait_for_timeout(random.randint(1200,2100))
+            except Exception:
+                continue
+
+        # Fallback: search manual
+        from urllib.parse import quote
+        q = quote(self.company)
+        search_url = self.BASE_SEARCH.format(q=q)
+        log.info(f"Searching G2: {search_url}")
+        try:
+            await self._harden_page(page)
+            await page.goto(search_url, wait_until="domcontentloaded")
+            await self._human_mouse(page, moves=2)
+        except Exception:
+            return None
+
+        try:
+            await page.wait_for_timeout(600)
+        except Exception:
+            pass
+
         possible_selectors = [
             f"a[href*='/products/{slug}/reviews']",
+            f"a[href*='/products/{slug}?']",
             f"a[href*='/products/{slug}']",
             "a.result-card__name",
             "a.search-result__title",
@@ -52,176 +222,176 @@ class G2Scraper(AsyncBaseScraper):
                 el = await page.query_selector(sel)
                 if not el:
                     continue
-                href = el.get_attribute("href")
+                href = await el.get_attribute("href")  # FIX: await
                 if not href:
                     continue
                 if href.startswith("/"):
                     href = "https://www.g2.com" + href
-                # Normalize to reviews page if not already there.
-                if "/products/" in href and not href.rstrip("/").endswith("reviews"):
-                    if "/reviews" not in href:
-                        href = href.rstrip("/") + "/reviews"
+                if "/products/" in href and "/reviews" not in href:
+                    href = href.rstrip("/") + "/reviews"
                 candidate = href
                 break
             except Exception:
                 continue
         if candidate:
-            log.info("Found product page: %s", candidate)
+            log.info("Found product page via search: %s", candidate)
         else:
-            log.warning("Could not auto-find product page: consider passing --product-url")
+            log.warning("G2: Could not auto-find product page; provide product_url.")
         return candidate
 
     async def extract_reviews_from_page(self, page) -> List[Dict]:
-        '''
-        Extracts review elements on the current page and returns a list of dicts.
-        Because site HTML may change, we try several selectors and fallback strategies.
-        '''
-        reviews = []
-        # candidate selectors - update them by inspecting real G2 page
+        reviews: List[Dict] = []
+
+        # Wait for reviews frame/section to appear
+        try:
+            await page.wait_for_selector("turbo-frame#reviews-and-filters, section#reviews", timeout=10000)
+        except Exception:
+            await page.wait_for_timeout(800)
+
+        # Early block detection (page may show an interstitial)
+        try:
+            snippet = (await page.content())[:6000].lower()
+            if "access blocked" in snippet or "unusual activity" in snippet:
+                return []  # Signal to higher level that the page is blocked
+        except Exception:
+            pass
+
+        # Light scroll to trigger lazy loading
+        try:
+            await page.evaluate("window.scrollBy(0, Math.floor(window.innerHeight*0.8))")
+            await page.wait_for_timeout(600)
+        except Exception:
+            pass
+
+        # Candidate selectors
         candidate_selectors = [
-            'div[data-testid="review-card"]',  # hypothetical test id
-            'div.g2-review',                   # hypothetical class
-            'article',                         # fallback: many sites wrap review in <article>
-            'div.review'                       # fallback
+            "turbo-frame#reviews-and-filters article",
+            "turbo-frame#reviews-and-filters [data-review-id]",
+            "section#reviews article",
+            "article[itemtype*='Review']",
+            "article",
         ]
+
         els = []
         for sel in candidate_selectors:
             try:
                 found = await page.query_selector_all(sel)
+                if found:
+                    els = found
+                    break
             except Exception:
-                found = []
-                reviews: List[Dict] = []
+                continue
 
-                # Try a small scroll to trigger lazy content
-                try:
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await page.wait_for_timeout(600)
-                except Exception:
-                    pass
-
-                # 1) JSON-LD extraction
-                try:
-                    scripts = await page.query_selector_all("script[type='application/ld+json']")
-                    import json
-                    from src.utils import parse_date_fuzzy as _p
-                    for s in scripts:
-                        try:
-                            raw = await s.inner_text()
-                            if not raw:
-                                continue
-                            data = json.loads(raw)
-                            nodes = data if isinstance(data, list) else [data]
-                            for node in nodes:
-                                if not isinstance(node, dict):
-                                    continue
-                                if node.get("@type") == "Review":
-                                    title = node.get("name") or node.get("headline")
-                                    body = node.get("reviewBody") or node.get("description")
-                                    dt = node.get("datePublished") or node.get("dateCreated")
-                                    rating = None
-                                    rr = node.get("reviewRating")
-                                    if isinstance(rr, dict):
-                                        rv = rr.get("ratingValue")
-                                        try:
-                                            rating = float(rv) if rv is not None else None
-                                        except Exception:
-                                            rating = None
-                                    author = node.get("author")
-                                    reviewer = None
-                                    if isinstance(author, dict):
-                                        reviewer = author.get("name")
-                                    d = _p(dt) if isinstance(dt, str) else None
-                                    reviews.append({
-                                        "title": title,
-                                        "review": body,
-                                        "date": d.isoformat() if d else dt,
-                                        "rating": rating,
-                                        "reviewer_name": reviewer,
-                                    })
-                        except Exception:
-                            continue
-                    if reviews:
-                        return reviews
-                except Exception:
-                    pass
-                els = found
-                break
-
+        # JSON-LD fallback
         if not els:
-            # fallback: try to find by role=article
-            els = await page.query_selector_all('article, div[class*="review"]')
+            try:
+                scripts = await page.query_selector_all("script[type='application/ld+json']")
+                for s in scripts:
+                    try:
+                        raw = await s.inner_text()
+                        data = json.loads(raw)
+                        nodes = data if isinstance(data, list) else [data]
+                        for node in nodes:
+                            if isinstance(node, dict) and node.get("@type") == "Review":
+                                title = node.get("name") or node.get("headline")
+                                body = node.get("reviewBody") or node.get("description")
+                                dt = node.get("datePublished") or node.get("dateCreated")
+                                rr = node.get("reviewRating") or {}
+                                rating = None
+                                if isinstance(rr, dict):
+                                    rv = rr.get("ratingValue")
+                                    try:
+                                        rating = float(rv) if rv is not None else None
+                                    except Exception:
+                                        pass
+                                author = node.get("author")
+                                reviewer = author.get("name") if isinstance(author, dict) else author
+                                d = parse_date_fuzzy(dt)
+                                reviews.append({
+                                    "title": title,
+                                    "review": body,
+                                    "date": d.isoformat() if d else dt,
+                                    "rating": rating,
+                                    "reviewer_name": reviewer
+                                })
+                    except Exception:
+                        continue
+                if reviews:
+                    return reviews
+            except Exception:
+                pass
+
         for el in els:
             try:
                 text = (await el.inner_text()).strip()
             except Exception:
                 text = ""
-            # Try to get title, date, rating, reviewer, etc, using a few heuristics:
-            title = None
-            date = None
+
+            async def first_text(selectors):
+                for s in selectors:
+                    try:
+                        node = await el.query_selector(s)
+                        if node:
+                            t = (await node.inner_text()).strip()
+                            if t:
+                                return t
+                    except Exception:
+                        continue
+                return None
+
+            title = await first_text(["[data-testid='review-title']", "h3", "h2"])  # FIX: await
+            dt_text = None
+            try:
+                t = await el.query_selector("time[datetime], time")
+                if t:
+                    iso = await t.get_attribute("datetime")
+                    if iso:
+                        dt_text = iso
+                    else:
+                        dt_text = (await t.inner_text()).strip()
+            except Exception:
+                pass
+
             rating = None
-            reviewer_name = None
-            source_url = None
-
-            # title heuristics
             try:
-                h = await el.query_selector("h3")
-                if h:
-                    title = (await h.inner_text()).strip()
+                r = await el.query_selector("[aria-label*='out of 5']")
+                if r:
+                    ar = await r.get_attribute("aria-label")
+                    if ar:
+                        m = re.search(r"([0-9]+(?:\.[0-9]+)?)", ar)
+                        if m:
+                            rating = float(m.group(1))
+                if rating is None:
+                    # Fallback: count stars
+                    full = await el.query_selector_all("svg.icon-star")
+                    half = await el.query_selector_all("svg.icon-star-half, svg.icon-star-half-empty")
+                    if full or half:
+                        rating = len(full) + 0.5 * len(half)
             except Exception:
                 pass
 
-            # date heuristics
-            # look for elements that look like a date (time tag, small tag, span with date text)
-            for ds in ["time", "span.date", "span[class*='date']", "div[class*='date']", "span:has-text(',')"]:
-                try:
-                    dd = await el.query_selector(ds)
-                    if dd:
-                        dtext = (await dd.inner_text()).strip()
-                        if dtext:
-                            date = dtext
-                            break
-                except Exception:
-                    continue
+            reviewer_name = await first_text(["[data-testid='reviewer-name']", "a[href*='/users/']", "span[class*='user']"])
+            body = await first_text(["[data-testid='review-body']", "div.review-body", "section[aria-label*='review']", "p"]) or text
 
-            # rating heuristic - look for aria-label like "5 out of 5 stars" or svg count
-            try:
-                r_el = await el.query_selector('[aria-label*="out of 5"]')
-                if r_el:
-                    rating_text = r_el.get_attribute("aria-label")
-                    # parse first number
-                    import re
-                    m = re.search(r'([0-9](?:\.[0-9])?)', rating_text)
-                    if m:
-                        rating = float(m.group(1))
-            except Exception:
-                pass
-
-            # reviewer name heuristic
-            try:
-                rn = await el.query_selector("div.reviewer-name, span.reviewer, span[class*='user']")
-                if rn:
-                    reviewer_name = (await rn.inner_text()).strip()
-            except Exception:
-                pass
-
-            # source url: if individual review has anchor
+            src = None
             try:
                 a = await el.query_selector("a[href*='/review/'], a[href*='#review']")
                 if a:
-                    href = a.get_attribute("href")
-                    source_url = href if href.startswith("http") else "https://www.g2.com" + href
+                    href = await a.get_attribute("href")
+                    if href:
+                        src = href if href.startswith("http") else "https://www.g2.com" + href
             except Exception:
                 pass
 
             reviews.append({
                 "title": title,
-                "review": text,
-                "date": date,
+                "review": body,
+                "date": dt_text,
                 "rating": rating,
                 "reviewer_name": reviewer_name,
-                "source_url": source_url,
-                "raw_html_snippet": None
+                "source_url": src
             })
+
         return reviews
 
 
@@ -313,3 +483,49 @@ def fetch_g2_reviews_api(
         page += 1
 
     return collected
+
+def parse_g2_reviews_from_html(html_text: str) -> List[Dict]:
+    """
+    Parse G2 reviews from a saved HTML file using JSON-LD Review objects.
+    This avoids live browsing when the site shows a challenge.
+    """
+    reviews: List[Dict] = []
+    # Find all JSON-LD script blocks
+    for m in re.finditer(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html_text, re.S|re.I):
+        raw = m.group(1).strip()
+        if not raw:
+            continue
+        # Unescape HTML entities
+        raw = htmllib.unescape(raw)
+        # Try to load as JSON; skip invalid blocks
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+        nodes = data if isinstance(data, list) else [data]
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            if node.get("@type") != "Review":
+                continue
+            title = node.get("name") or node.get("headline")
+            body = node.get("reviewBody") or node.get("description")
+            dt = node.get("datePublished") or node.get("dateCreated")
+            rr = node.get("reviewRating") or {}
+            rating = None
+            if isinstance(rr, dict):
+                try:
+                    rating = float(rr.get("ratingValue")) if rr.get("ratingValue") is not None else None
+                except Exception:
+                    rating = None
+            author = node.get("author")
+            reviewer = author.get("name") if isinstance(author, dict) else author
+            d = parse_date_fuzzy(dt)
+            reviews.append({
+                "title": title,
+                "review": body,
+                "date": d.isoformat() if d else dt,
+                "rating": rating,
+                "reviewer_name": reviewer
+            })
+    return reviews

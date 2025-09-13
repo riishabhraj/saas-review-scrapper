@@ -1,6 +1,9 @@
 # src/scrapers/async_base_scraper.py
 import asyncio
-import os, sys
+import logging
+from pathlib import Path
+from src.utils import ensure_outputs_dir
+import os, sys, random
 from datetime import date
 from typing import List, Dict, Optional
 from playwright.async_api import async_playwright, Page
@@ -19,98 +22,101 @@ class AsyncBaseScraper:
         self.headless = headless
         self.debug = debug
 
-    async def scrape(self) -> List[Dict]:
+    async def _maybe_accept_cookies(self, page):
+        selectors = [
+            "button:has-text('Accept all')",
+            "button:has-text('Accept All')",
+            "button:has-text('Accept')",
+            "[aria-label*='Accept']",
+            "button#onetrust-accept-btn-handler",
+        ]
+        for sel in selectors:
+            try:
+                btn = await page.query_selector(sel)
+                if btn:
+                    await btn.click()
+                    await page.wait_for_timeout(500)
+                    break
+            except Exception:
+                continue
+
+    async def _try_load_more(self, page, max_clicks=3):
+        for _ in range(max_clicks):
+            try:
+                btn = await page.query_selector("button:has-text('Load more'), button:has-text('Show more')")
+                if not btn:
+                    return
+                if await btn.is_disabled():
+                    return
+                await btn.click()
+                await page.wait_for_timeout(1200)
+            except Exception:
+                return
+
+    async def _debug_dump(self, page, tag):
+        if not self.debug:
+            return
+        out = ensure_outputs_dir()
+        html_path = out / f"debug_{self.__class__.__name__.lower()}_{tag}.html"
+        png_path = out / f"debug_{self.__class__.__name__.lower()}_{tag}.png"
+        try:
+            await page.screenshot(path=str(png_path), full_page=True)
+        except Exception:
+            pass
+        try:
+            html = await page.content()
+            html_path.write_text(html, encoding="utf-8", errors="ignore")
+        except Exception:
+            pass
+
+    async def scrape(self):
+        from playwright.async_api import async_playwright
         try:
             async with async_playwright() as p:
+                # Prefer Edge on Windows if available; fallback to Chromium
+                # Build random-ish desktop Chrome UA fragment
+                major = random.randint(118, 125)
+                ua = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+                proxy_server = os.getenv("PLAYWRIGHT_PROXY") or os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY")
+                launch_kwargs = {"headless": self.headless}
+                if proxy_server:
+                    launch_kwargs["proxy"] = {"server": proxy_server}
+                # Prefer Edge channel if available
                 try:
-                    # Honor corporate proxies if set
-                    launch_kwargs = {"headless": self.headless}
-                    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") \
-                        or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy") \
-                        or os.environ.get("ALL_PROXY") or os.environ.get("all_proxy")
-                    if proxy:
-                        launch_kwargs["proxy"] = {"server": proxy}
-
-                    # On Windows, prefer system Edge channel to pick up OS networking
-                    if sys.platform.startswith("win"):
-                        try:
-                            browser = await p.chromium.launch(channel="msedge", **launch_kwargs)
-                        except Exception:
-                            browser = await p.chromium.launch(**launch_kwargs)
-                    else:
-                        browser = await p.chromium.launch(**launch_kwargs)
-                except NotImplementedError as ne:  # Python 3.13 Windows issue
-                    raise RuntimeError(
-                        "Playwright subprocess creation not supported in this Python runtime. "
-                        "Workarounds: (1) Use Python 3.11 or 3.12; (2) Run under WSL2 Linux; (3) Try 'pip install playwright==1.44' then reinstall browsers; (4) Use Docker linux container."
-                    ) from ne
-                # Use a common desktop Chrome UA and sensible defaults
+                    browser = await p.chromium.launch(channel="msedge", **launch_kwargs)
+                except Exception:
+                    browser = await p.chromium.launch(**launch_kwargs)
+                extra_headers = {
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Upgrade-Insecure-Requests": "1",
+                }
                 context = await browser.new_context(
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
-                    ),
+                    viewport={"width": 1366, "height": 900},
+                    user_agent=ua,
                     locale="en-US",
-                    viewport={"width": 1400, "height": 900},
+                    extra_http_headers=extra_headers,
                 )
                 page = await context.new_page()
-                try:
-                    product_page = await self.find_product_page(page)
-                    if not product_page:
-                        raise RuntimeError("Product page not found")
-                    await page.goto(product_page, wait_until="load")
-                    # Try to accept cookie banners if present
-                    try:
-                        await self.accept_cookies(page)
-                    except Exception:
-                        pass
-                    if self.debug:
-                        await self.debug_dump(page, "loaded")
-                    # Give the page a moment and wait for any review-related selector
-                    try:
-                        await page.wait_for_selector(
-                            'script[type="application/ld+json"], article, div[class*="review"], [itemtype*="Review"]',
-                            timeout=6000,
-                        )
-                    except Exception:
-                        await asyncio.sleep(0.5)
-                    all_reviews: List[Dict] = []
-                    page_num = 0
-                    while True:
-                        page_num += 1
-                        log.info(f"[page {page_num}] extracting reviews...")
-                        reviews = await self.extract_reviews_from_page(page)
-                        if not reviews:
-                            log.info("No reviews extracted on this page. Stopping.")
-                            if self.debug:
-                                await self.debug_dump(page, f"empty_p{page_num}")
-                            break
-                        kept = []
-                        for r in reviews:
-                            d = None
-                            if isinstance(r.get("date"), date):
-                                d = r["date"]
-                            elif isinstance(r.get("date"), str):
-                                d = parse_date_fuzzy(r["date"])
-                            if d is None:
-                                kept.append(r)
-                            else:
-                                if self.start_date <= d <= self.end_date:
-                                    r["date"] = d.isoformat()
-                                    kept.append(r)
-                        all_reviews.extend(kept)
-                        if await self.should_stop_paging(page, reviews):
-                            break
-                        next_found = await self.go_to_next_page(page)
-                        if not next_found:
-                            break
-                        await asyncio.sleep(1.0)
-                    return all_reviews
-                finally:
-                    await context.close()
-                    await browser.close()
-        except RuntimeError:
-            raise
+
+                product_page = await self.find_product_page(page)
+                if not product_page:
+                    raise RuntimeError("Product page not found")
+
+                await page.goto(product_page, wait_until="load")
+                await self._maybe_accept_cookies(page)
+                # Scroll to trigger lazy content
+                await page.wait_for_timeout(800)
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)")
+                await page.wait_for_timeout(600)
+                await self._try_load_more(page, max_clicks=2)
+                await self._debug_dump(page, "loaded")
+
+                items = await self.extract_reviews_from_page(page)
+                await context.close()
+                await browser.close()
+                return items
+        except NotImplementedError as ne:
+            raise RuntimeError("Playwright cannot spawn subprocesses in this environment. Run in Python 3.12 or Linux/WSL.") from ne
         except Exception as e:
             raise RuntimeError(f"Unexpected scraper failure: {e}") from e
 
